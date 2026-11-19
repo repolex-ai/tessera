@@ -1,0 +1,19 @@
+[package]
+name = "tessera"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Check who is asking a Subtexture daemon, and whether they may read or write its named graphs"
+repository = "https://github.com/repolex-ai/tessera"
+publish = false
+
+# tessera checks Ed25519 identity tokens, service grants, and named-graph access
+# policies across Syrinx, Pan, git-lex, ravel and Horae. Core verification and
+# access checks touch no files, open no sockets and use no async runtime; the
+# optional keyring helper reads git-lex's local JWKS, grant list and machine
+# owner files with std::fs alone.
+[dependencies]
+base64 = "0.22"
+ed25519-dalek = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
