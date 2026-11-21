@@ -54,16 +54,101 @@ pub const PLATFORM_ROOT: &str = "https://repolex.ai/";
 /// Unscoped Soul IRI prefix, used for keys listed before store-scoped `sub`
 /// addresses were recorded on `jwks.json`.
 pub const SOUL_IRI: &str = "https://repolex.ai/soul/Soul/";
-/// Longest token lifetime accepted by any verifier (24 hours).
-pub const MAX_LIFETIME_SECS: u64 = 24 * 3600;
+/// Default longest token lifetime accepted by a verifier (7 days; overridable
+/// at runtime via `~/.lex/identity/policy.json`, goodlux 2026-11-21).
+pub const MAX_LIFETIME_SECS: u64 = 7 * 24 * 3600;
 /// Clock skew tolerated between signer and verifier (60 seconds).
 pub const SKEW_SECS: u64 = 60;
-/// Shortest grant lifetime accepted (2 days — longer than any plain token).
-pub const MIN_GRANT_SECS: u64 = 2 * 24 * 3600;
-/// Longest grant lifetime accepted (366 days).
+/// Default shortest grant lifetime accepted (8 days — strictly longer than any
+/// default plain token).
+pub const MIN_GRANT_SECS: u64 = 8 * 24 * 3600;
+/// Default longest grant lifetime accepted (366 days).
 pub const MAX_GRANT_SECS: u64 = 366 * 24 * 3600;
+/// Upper sanity bound on `max_grant_secs` in `policy.json` (10 years).
+const HARD_MAX_GRANT_SECS: u64 = 10 * 366 * 24 * 3600;
 /// Header `typ` distinguishing a grant from a plain token.
 pub const GRANT_TYP: &str = "grant+jwt";
+
+const fn default_max_token_secs() -> u64 {
+    MAX_LIFETIME_SECS
+}
+const fn default_min_grant_secs() -> u64 {
+    MIN_GRANT_SECS
+}
+const fn default_max_grant_secs() -> u64 {
+    MAX_GRANT_SECS
+}
+
+/// Runtime-configurable token and grant lifetime limits
+/// (`~/.lex/identity/policy.json`).
+///
+/// When `policy.json` is absent, [`Policy::default()`] applies (`7` days max
+/// token lifetime, `8` days min grant lifetime, `366` days max grant lifetime).
+/// `token_lifetime_secs` is optional so `git-lex` can read its issuing lifetime
+/// from the same file without daemon rebuilds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Policy {
+    /// Optional issuing lifetime read by `git-lex` when minting tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_lifetime_secs: Option<u64>,
+    /// Maximum lifetime (`exp - iat`) accepted for plain and acting tokens.
+    #[serde(default = "default_max_token_secs")]
+    pub max_token_secs: u64,
+    /// Minimum lifetime (`exp - iat`) required on a `grant+jwt` (`> max_token_secs`).
+    #[serde(default = "default_min_grant_secs")]
+    pub min_grant_secs: u64,
+    /// Maximum lifetime (`exp - iat`) accepted on a `grant+jwt`.
+    #[serde(default = "default_max_grant_secs")]
+    pub max_grant_secs: u64,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Policy {
+            token_lifetime_secs: None,
+            max_token_secs: MAX_LIFETIME_SECS,
+            min_grant_secs: MIN_GRANT_SECS,
+            max_grant_secs: MAX_GRANT_SECS,
+        }
+    }
+}
+
+impl Policy {
+    /// Check that lifetime bounds are coherent (`0 < max_token_secs < min_grant_secs <= max_grant_secs`).
+    pub fn validate(self) -> Result<Self> {
+        if self.max_token_secs == 0 {
+            return Err(Error("policy max_token_secs must be greater than 0".into()));
+        }
+        if let Some(issue) = self.token_lifetime_secs {
+            if issue == 0 || issue > self.max_token_secs {
+                return Err(Error(format!(
+                    "policy token_lifetime_secs ({issue}) must be between 1 and max_token_secs ({})",
+                    self.max_token_secs
+                )));
+            }
+        }
+        if self.min_grant_secs <= self.max_token_secs {
+            return Err(Error(format!(
+                "policy min_grant_secs ({}) must be strictly greater than max_token_secs ({})",
+                self.min_grant_secs, self.max_token_secs
+            )));
+        }
+        if self.max_grant_secs < self.min_grant_secs || self.max_grant_secs > HARD_MAX_GRANT_SECS {
+            return Err(Error(format!(
+                "policy max_grant_secs ({}) must be between min_grant_secs ({}) and {HARD_MAX_GRANT_SECS}",
+                self.max_grant_secs, self.min_grant_secs
+            )));
+        }
+        Ok(self)
+    }
+
+    /// Parse and validate `policy.json` text.
+    pub fn from_json(text: &str) -> Result<Self> {
+        let parsed: Policy = serde_json::from_str(text)
+            .map_err(|e| Error(format!("policy does not parse as JSON: {e}")))?;
+        parsed.validate()
+    }
+}
 
 /// One Ed25519 public key from `jwks.json`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -414,34 +499,59 @@ fn build_caller(
     }
 }
 
-/// Check any Subtexture token: an identity's own token, or a service token
-/// carrying a grant.
-///
-/// Which path runs is chosen solely from whether the unverified claims carry
-/// `grant` or `act`; nothing else in the unverified claims is trusted before
-/// signatures are checked. `grants` is only called on the service path.
+/// Check any Subtexture token using [`Policy::default()`] lifetime limits.
 pub fn verify_caller(
     token: &str,
     key_for: impl Fn(&str) -> Result<Key>,
     grants: impl Fn() -> Result<Grants>,
     now: u64,
 ) -> Result<Caller> {
-    let outer = split_jwt(token, "token")?;
-    if outer.claims.get("grant").is_none() && outer.claims.get("act").is_none() {
-        return verify_plain_parts(&outer, key_for, now);
-    }
-    verify_service(&outer, key_for, grants, now)
+    verify_caller_with_policy(token, key_for, grants, &Policy::default(), now)
 }
 
-/// Check an identity's own plain token (refusing service tokens and grants).
-pub fn verify_plain(token: &str, key_for: impl Fn(&str) -> Result<Key>, now: u64) -> Result<Caller> {
+/// Check any Subtexture token against explicit [`Policy`] lifetime limits: an
+/// identity's own token, or a service token carrying a grant.
+///
+/// Which path runs is chosen solely from whether the unverified claims carry
+/// `grant` or `act`; nothing else in the unverified claims is trusted before
+/// signatures are checked. `grants` is only called on the service path.
+pub fn verify_caller_with_policy(
+    token: &str,
+    key_for: impl Fn(&str) -> Result<Key>,
+    grants: impl Fn() -> Result<Grants>,
+    policy: &Policy,
+    now: u64,
+) -> Result<Caller> {
+    let policy = (*policy).validate()?;
     let outer = split_jwt(token, "token")?;
-    verify_plain_parts(&outer, key_for, now)
+    if outer.claims.get("grant").is_none() && outer.claims.get("act").is_none() {
+        return verify_plain_parts(&outer, key_for, &policy, now);
+    }
+    verify_service(&outer, key_for, grants, &policy, now)
+}
+
+/// Check an identity's own plain token using [`Policy::default()`] lifetime limits.
+pub fn verify_plain(token: &str, key_for: impl Fn(&str) -> Result<Key>, now: u64) -> Result<Caller> {
+    verify_plain_with_policy(token, key_for, &Policy::default(), now)
+}
+
+/// Check an identity's own plain token (refusing service tokens and grants)
+/// against explicit [`Policy`] lifetime limits.
+pub fn verify_plain_with_policy(
+    token: &str,
+    key_for: impl Fn(&str) -> Result<Key>,
+    policy: &Policy,
+    now: u64,
+) -> Result<Caller> {
+    let policy = (*policy).validate()?;
+    let outer = split_jwt(token, "token")?;
+    verify_plain_parts(&outer, key_for, &policy, now)
 }
 
 fn verify_plain_parts(
     t: &Jwt<'_>,
     key_for: impl Fn(&str) -> Result<Key>,
+    policy: &Policy,
     now: u64,
 ) -> Result<Caller> {
     // 1. EdDSA was fixed in `split_jwt`; a grant cannot pass as a plain token.
@@ -469,8 +579,8 @@ fn verify_plain_parts(
             "the token says it is a different squaddie than the one whose key signed it".into(),
         ));
     }
-    // 5. Dates and maximum 24-hour lifetime.
-    let (_, exp) = check_times(&t.claims, now, 0, MAX_LIFETIME_SECS, "token")?;
+    // 5. Dates and configured maximum token lifetime.
+    let (_, exp) = check_times(&t.claims, now, 0, policy.max_token_secs, "token")?;
     // 6. Audience.
     check_audience(&t.claims, "token")?;
 
@@ -481,6 +591,7 @@ fn verify_service(
     outer: &Jwt<'_>,
     key_for: impl Fn(&str) -> Result<Key>,
     grants: impl Fn() -> Result<Grants>,
+    policy: &Policy,
     now: u64,
 ) -> Result<Caller> {
     let text = |v: &Value, f: &str| v.get(f).and_then(Value::as_str).map(str::to_string);
@@ -518,7 +629,13 @@ fn verify_service(
                 .into(),
         ));
     }
-    let (_, grant_exp) = check_times(&g.claims, now, MIN_GRANT_SECS, MAX_GRANT_SECS, "grant")?;
+    let (_, grant_exp) = check_times(
+        &g.claims,
+        now,
+        policy.min_grant_secs,
+        policy.max_grant_secs,
+        "grant",
+    )?;
     check_audience(&g.claims, "grant")?;
     let (Some(jti), Some(service), Some(scope)) = (
         text(&g.claims, "jti"),
@@ -583,7 +700,7 @@ fn verify_service(
     }
 
     // 5. Token dates, and never outliving the grant.
-    let (_, exp) = check_times(&outer.claims, now, 0, MAX_LIFETIME_SECS, "token")?;
+    let (_, exp) = check_times(&outer.claims, now, 0, policy.max_token_secs, "token")?;
     if exp > grant_exp {
         return Err(Error("the token outlives its grant".into()));
     }

@@ -27,9 +27,10 @@ pub mod verify;
 pub use access::{check_read, require_scope, Denial, GraphAccess, Visibility};
 pub use keyring::{HostKeys, Keyring, KeyringStatus, Owner};
 pub use verify::{
-    bearer, verify_caller, verify_plain, www_authenticate_insufficient_scope,
-    www_authenticate_invalid_token, Caller, GrantRecord, Grants, Jwks, Key, AUDIENCE, GRANT_TYP,
-    MAX_GRANT_SECS, MAX_LIFETIME_SECS, MIN_GRANT_SECS, PLATFORM_ROOT, SKEW_SECS, SOUL_IRI,
+    bearer, verify_caller, verify_caller_with_policy, verify_plain, verify_plain_with_policy,
+    www_authenticate_insufficient_scope, www_authenticate_invalid_token, Caller, GrantRecord,
+    Grants, Jwks, Key, Policy, AUDIENCE, GRANT_TYP, MAX_GRANT_SECS, MAX_LIFETIME_SECS,
+    MIN_GRANT_SECS, PLATFORM_ROOT, SKEW_SECS, SOUL_IRI,
 };
 
 /// Why a token, key list or configuration was refused. Written in plain words

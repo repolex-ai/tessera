@@ -8,7 +8,7 @@ A *tessera* was the small clay, bone or lead admission token handed to a guest o
 |---|---|---|
 | `verify` | Check an `Authorization: Bearer <token>` header against a key set and, for a service acting under a grant, a grant list | No |
 | `access` | Check whether a caller may read a named graph from its `owner`, `visibility`, and `readableBy` metadata plus the machine's `Owner` | No |
-| `keyring` | Load and refresh `~/.lex/identity/{jwks.json, grants.json, owner.json}`, or stand down (`Keyring::Off`) for standalone installs | `std::fs` only |
+| `keyring` | Load and refresh `~/.lex/identity/{jwks.json, grants.json, owner.json, policy.json}`, or stand down (`Keyring::Off`) for standalone installs | `std::fs` only |
 
 tessera opens no sockets, pulls in no HTTP framework and uses no async runtime. It depends on `ed25519-dalek`, `base64`, `serde` and `serde_json` alone — the exact versions already in Syrinx, Pan and git-lex.
 
@@ -56,18 +56,18 @@ check_read(caller.as_ref(), &policy, machine_owner.as_ref())?;
 2. `kid` selects which Ed25519 entry in `jwks.json` to try, and nothing more.
 3. The signature passes strict Ed25519 verification (`VerifyingKey::verify_strict`) against that listed key.
 4. `sub` equals the exact address `jwks.json` records for that key (`https://repolex.ai/{squad}/{user}/soul/Soul/{user}`, or `https://repolex.ai/soul/Soul/{id}` on older entries).
-5. `iat <= now + 60`, `exp > now`, and `exp - iat <= 86400` (at most 24 hours).
+5. `iat <= now + 60`, `exp > now`, and `exp - iat <= max_token_secs` (7 days by default; configurable at runtime via `~/.lex/identity/policy.json` without rebuilding daemons).
 6. `aud == "subtexture"`.
 
 ### Service tokens carrying a grant (`git-lex`, 2026-11-17)
 
 When a UI server or worker acts for someone, it holds its own Ed25519 key and presents a short-lived JWT carrying a `grant+jwt` signed by the grantor:
 
-1. The inner grant is verified strictly with the grantor's listed key (`typ == "grant+jwt"`, `sub` and `iss` match the grantor's listed address, lifetime 2 to 366 days, `aud == "subtexture"`, Ed25519 `cnf.jwk`).
+1. The inner grant is verified strictly with the grantor's listed key (`typ == "grant+jwt"`, `sub` and `iss` match the grantor's listed address, lifetime 8 to 366 days by default or `min_grant_secs..=max_grant_secs` from `policy.json`, `aud == "subtexture"`, Ed25519 `cnf.jwk`).
 2. The grant's `jti` is on `~/.lex/identity/grants.json` with no `ended` timestamp, matching `grantor`, `service` and `x` (`grants.json` is read on every check so `git lex identity revoke` takes effect immediately).
 3. The outer token's signature verifies strictly with `cnf.jwk.x`.
 4. `outer.sub == grant.sub`, `outer.act.sub == service`, and `outer.iss == "service:{service}"`.
-5. The outer token passes the 24-hour window and does not outlive `grant.exp`.
+5. The outer token passes `max_token_secs` and does not outlive `grant.exp`.
 6. `outer.aud == "subtexture"`.
 
 Both paths return a [`Caller`] carrying `subject` (the verified Soul IRI), `genesis` (the 40-hex `kid`), `username`, `squad`, `actor`, `scope`, and `expires`.

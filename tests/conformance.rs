@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use tessera::{
     bearer, check_read, require_scope, verify_caller, verify_plain,
     www_authenticate_insufficient_scope, www_authenticate_invalid_token, Caller, Denial, Error,
-    Grants, GraphAccess, HostKeys, Jwks, Key, Keyring, Owner, Visibility, AUDIENCE, GRANT_TYP,
-    MAX_LIFETIME_SECS, SKEW_SECS, SOUL_IRI,
+    Grants, GraphAccess, HostKeys, Jwks, Key, Keyring, Owner, Policy, Visibility, AUDIENCE,
+    GRANT_TYP, MAX_LIFETIME_SECS, MIN_GRANT_SECS, SKEW_SECS, SOUL_IRI,
 };
 
 const NOW: u64 = 1_794_700_000;
@@ -401,7 +401,7 @@ fn service_acts_only_through_grant_in_force() {
     )
     .contains("different service"));
 
-    // Grant lifetime < 2 days, > 366 days, and token outliving its grant.
+    // Grant lifetime < 8 days, > 366 days, and token outliving its grant.
     let short = make_grant(
         &key(1),
         ME,
@@ -409,7 +409,7 @@ fn service_acts_only_through_grant_in_force() {
         &svc,
         "syrinx:read",
         NOW - 10,
-        NOW + DAY,
+        NOW + 7 * DAY,
     );
     assert!(refused(
         &make_service_token(&svc, &me_iri, "subtexture-ui", &short, NOW, NOW + 60),
@@ -438,7 +438,7 @@ fn service_acts_only_through_grant_in_force() {
         &me_iri,
         &svc,
         "syrinx:read",
-        NOW - 3 * DAY,
+        NOW - 10 * DAY,
         NOW + 600,
     );
     assert!(refused(
@@ -669,5 +669,81 @@ fn owner_file_missing_is_none_and_corrupt_is_err() {
     .unwrap();
     let loaded = Owner::load_file(&path).unwrap().unwrap();
     assert_eq!(loaded.genesis, ADMIN);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn seven_day_default_and_live_policy_json_override_without_restart() {
+    assert_eq!(MAX_LIFETIME_SECS, 7 * DAY);
+    assert_eq!(MIN_GRANT_SECS, 8 * DAY);
+
+    let dir = temp_dir("policy");
+    let jwks_path = dir.join("jwks.json");
+    let policy_path = dir.join("policy.json");
+    let x1 = URL_SAFE_NO_PAD.encode(key(1).verifying_key().to_bytes());
+    std::fs::write(
+        &jwks_path,
+        json!({ "keys": [{ "kty": "OKP", "crv": "Ed25519", "kid": ME, "x": x1 }] }).to_string(),
+    )
+    .unwrap();
+
+    let hk = HostKeys::new(jwks_path);
+    let seven_day_tok = format!(
+        "Bearer {}",
+        sign(&key(1), header(ME), legacy_claims(ME, NOW, NOW + 7 * DAY))
+    );
+    let eight_day_tok = format!(
+        "Bearer {}",
+        sign(&key(1), header(ME), legacy_claims(ME, NOW, NOW + 8 * DAY))
+    );
+
+    // Default (no policy.json): 7-day token passes, 8-day token is refused.
+    assert_eq!(
+        hk.identify(Some(&seven_day_tok), NOW)
+            .unwrap()
+            .unwrap()
+            .genesis,
+        ME
+    );
+    assert!(hk.identify(Some(&eight_day_tok), NOW).is_err());
+
+    // Tighten at runtime via policy.json (max 24h, issuing 12h, min grant 2d):
+    // takes effect immediately on the existing HostKeys instance with no restart!
+    std::fs::write(
+        &policy_path,
+        json!({
+            "token_lifetime_secs": 12 * 3600,
+            "max_token_secs": DAY,
+            "min_grant_secs": 2 * DAY
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert!(hk.status().error.is_none());
+    assert!(hk
+        .identify(Some(&seven_day_tok), NOW)
+        .unwrap_err()
+        .0
+        .contains("lifetime"));
+    let one_day_tok = format!(
+        "Bearer {}",
+        sign(&key(1), header(ME), legacy_claims(ME, NOW, NOW + DAY))
+    );
+    assert_eq!(
+        hk.identify(Some(&one_day_tok), NOW).unwrap().unwrap().genesis,
+        ME
+    );
+
+    // Incoherent policy.json (min_grant_secs <= max_token_secs, or token_lifetime_secs > max_token_secs)
+    // is refused loudly and surfaced on status().
+    assert!(Policy::from_json(r#"{"max_token_secs": 86400, "min_grant_secs": 86400}"#).is_err());
+    assert!(
+        Policy::from_json(r#"{"token_lifetime_secs": 90000, "max_token_secs": 86400, "min_grant_secs": 172800}"#)
+            .is_err()
+    );
+    std::fs::write(&policy_path, "{bad json").unwrap();
+    assert!(hk.status().error.is_some());
+    assert!(hk.identify(Some(&one_day_tok), NOW).is_err());
+
     std::fs::remove_dir_all(&dir).ok();
 }

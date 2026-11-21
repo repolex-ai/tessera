@@ -9,11 +9,25 @@
 //! [`Keyring`] wraps [`HostKeys`] with an [`Keyring::Off`] variant so engines
 //! that also run standalone without Subtexture (such as Pan) share one type.
 
-use crate::verify::{bearer, verify_caller, Caller, Grants, Jwks, Key};
+use crate::verify::{bearer, verify_caller_with_policy, Caller, Grants, Jwks, Key, Policy};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
+
+impl Policy {
+    /// Read `policy.json` at `path`. A missing file returns
+    /// `Ok(Policy::default())`; a file that cannot be read, does not parse, or
+    /// sets incoherent bounds returns `Err` (never silently ignored).
+    pub fn load_file(path: &Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Self::from_json(&text)
+                .map_err(|e| Error(format!("{}: {e}", path.display()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Policy::default()),
+            Err(e) => Err(Error(format!("cannot read {}: {e}", path.display()))),
+        }
+    }
+}
 
 /// The owner of this machine (`~/.lex/identity/owner.json`), recorded by
 /// `git lex identity owner` (goodlux, 2026-11-16). The machine owner is a
@@ -102,6 +116,11 @@ impl HostKeys {
         self.jwks_path.with_file_name("owner.json")
     }
 
+    /// Sibling `policy.json` path (`~/.lex/identity/policy.json`).
+    pub fn policy_path(&self) -> PathBuf {
+        self.jwks_path.with_file_name("policy.json")
+    }
+
     /// Re-read `jwks.json` from disk and replace the in-memory cache.
     pub fn reload(&self) -> Result<usize> {
         let text = std::fs::read_to_string(&self.jwks_path).map_err(|e| {
@@ -121,20 +140,31 @@ impl HostKeys {
         Ok(count)
     }
 
-    /// Refresh and report the key list status for `/health`.
+    /// Refresh and report the key list (and optional `policy.json`) status for
+    /// `/health`.
     pub fn status(&self) -> KeyringStatus {
-        match self.reload() {
-            Ok(n) => KeyringStatus {
+        match (self.reload(), self.policy()) {
+            (Ok(n), Ok(_)) => KeyringStatus {
                 keys_file: self.jwks_path.clone(),
                 squaddies_with_a_key: n,
                 error: None,
             },
-            Err(e) => KeyringStatus {
+            (Ok(n), Err(e)) => KeyringStatus {
+                keys_file: self.jwks_path.clone(),
+                squaddies_with_a_key: n,
+                error: Some(e.0),
+            },
+            (Err(e), _) => KeyringStatus {
                 keys_file: self.jwks_path.clone(),
                 squaddies_with_a_key: 0,
                 error: Some(e.0),
             },
         }
+    }
+
+    /// Load the sibling `policy.json`, or [`Policy::default()`] when absent.
+    pub fn policy(&self) -> Result<Policy> {
+        Policy::load_file(&self.policy_path())
     }
 
     /// Load the sibling `owner.json`, if recorded on this machine.
@@ -183,16 +213,25 @@ impl HostKeys {
         self.verify_token(token, now).map(Some)
     }
 
-    /// Verify a raw JWT string against this host's `jwks.json` and `grants.json`.
+    /// Verify a raw JWT string against this host's `jwks.json`, `grants.json`,
+    /// and optional `policy.json`.
     pub fn verify_token(&self, token: &str, now: u64) -> Result<Caller> {
-        match verify_caller(token, |kid| self.key(kid), || self.grants(), now) {
+        let policy = self.policy()?;
+        match verify_caller_with_policy(token, |kid| self.key(kid), || self.grants(), &policy, now)
+        {
             Ok(caller) => Ok(caller),
             Err(first) => {
                 let before = self.cached.read().unwrap().clone();
                 if self.reload().is_err() || *self.cached.read().unwrap() == before {
                     return Err(first);
                 }
-                verify_caller(token, |kid| self.key(kid), || self.grants(), now)
+                verify_caller_with_policy(
+                    token,
+                    |kid| self.key(kid),
+                    || self.grants(),
+                    &policy,
+                    now,
+                )
             }
         }
     }
